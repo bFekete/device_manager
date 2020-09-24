@@ -16,6 +16,19 @@ params = JSON.parse(STDIN.read)
 noop = (params['_noop']) ? '--noop' : ''
 target = (params['target']) ? params['target'] : ''
 timeout = (params['timeout'].to_i > 0) ? params['timeout'].to_i : default_timeout
+apply = (params['apply']) ? "--apply=#{params['apply']}" : ''
+
+# Validation for apply
+if params['apply']
+  # Puppet device --apply was released in Puppet 5.5
+  if Gem::Version.new(Puppet.version) < Gem::Version.new('5.5')
+    raise "puppet device --apply does not exist in Puppet version: #{Puppet.version}. --apply was added in Puppet 5.5."
+  end
+
+  unless File.file?(params['apply'])
+    raise "Invalid value for parameter 'apply'. #{params['apply']} does not exist.'"
+  end
+end
 
 # Read all devices, or just the target device.
 
@@ -55,10 +68,8 @@ end
 
 # Run 'puppet device' for each device, or just the target device.
 
-def run_puppet_device(devices, noop, timeout)
-  os = Facter.value(:os) || {}
-  osfamily = os['family']
-  if osfamily == 'windows'
+def run_puppet_device(devices, noop, timeout, apply)
+  if Gem.win_platform?
     env_windows_installdir = Facter.value(:env_windows_installdir) || 'C:\Program Files\Puppet Labs\Puppet'
     puppet_command = %("#{env_windows_installdir}\bin\puppet")
   else
@@ -72,23 +83,24 @@ def run_puppet_device(devices, noop, timeout)
   devices.map do |device_name, _device|
     target = "--target=#{device_name}"
     line = ''
-    error_message = ''
+    error_message = []
     configuration_version = ''
     catalog_seconds = ''
     status = ''
     result = ''
 
     begin
-      Open3.popen2e(puppet_command, 'device', user, '--waitforcert=0', '--verbose', target, noop) do |_, oe, w|
+      Open3.popen2e(puppet_command, 'device', user, '--waitforcert=0', '--verbose', target, noop, apply) do |_, oe, w|
         begin
           Timeout.timeout(timeout) do
             until oe.eof?
               line = oe.readline
               if (matched = line.match(%r{Error: (?<error>.*)}))
-                error_message = matched[:error]
+                error_message << line
+                results['error_count'] += 1
               end
               if (matched = line.match(%r{Exiting; (?<certificate>no certificate found and waitforcert is disabled)}))
-                error_message = matched[:certificate]
+                error_message << matched[:certificate]
               end
               if (matched = line.match(%r{Applying configuration version '(?<version>.*?)'}))
                 configuration_version = matched[:version]
@@ -100,11 +112,12 @@ def run_puppet_device(devices, noop, timeout)
           end
         rescue Timeout::Error
           Process.kill('KILL', w.pid)
-          error_message = 'timeout error'
+          error_message << 'timeout error'
         end
       end
     rescue => e
-      error_message = e.message
+      error_message << e.message
+      puts e.message
     end
 
     if error_message.empty?
@@ -112,8 +125,7 @@ def run_puppet_device(devices, noop, timeout)
       result = "applied configuration version '#{configuration_version}' in #{catalog_seconds} seconds"
     else
       status = 'error'
-      result = error_message.gsub(%r{\e\[(\d+)m}, '')
-      results['error_count'] = results['error_count'] + 1
+      results['error_message'] = error_message
     end
 
     results[device_name] = {}
@@ -157,8 +169,9 @@ def return_results(params, results)
   if results['error_count'] > 0
     exit_code = 1
     error_s = (results['error_count'] == 1) ? 'error' : 'errors'
+    error_message = results['error_message'].join('')
     result[:_error] = {
-      msg: "puppet device run #{error_s}: review task status via the Console",
+      msg: "puppet device run #{error_s}: review task status via the Console\n#{error_message}",
       kind: 'puppetlabs/device_manager',
       details: {
         params: {
@@ -185,6 +198,6 @@ devices = read_device_configuration(target)
 if devices.count.zero?
   return_configuration_error(params)
 else
-  results = run_puppet_device(devices, noop, timeout)
+  results = run_puppet_device(devices, noop, timeout, apply)
   return_results(params, results)
 end
